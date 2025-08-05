@@ -1,0 +1,411 @@
+{% extends 'base.html' %}
+
+{% block title %}Camera Dashboard{% endblock %}
+
+{% block content %}
+<div class="space-y-8">
+    <!-- Header Section -->
+    <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center space-y-4 lg:space-y-0">
+        <div>
+            <h1 class="text-4xl font-bold text-gray-800 mb-2">Camera Dashboard</h1>
+            <p class="text-gray-600">Monitor and control your surveillance cameras</p>
+        </div>
+        
+        <!-- Global Controls -->
+        <div class="flex flex-wrap gap-3">
+            <button onclick="takeAllSnapshots()" 
+                    class="btn-success text-white px-4 py-2 rounded-lg shadow-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2">
+                <i class="fas fa-camera"></i>
+                <span>All Snapshots</span>
+            </button>
+            
+            <button onclick="startAllRecording()" 
+                    class="btn-danger text-white px-4 py-2 rounded-lg shadow-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2">
+                <i class="fas fa-record-vinyl"></i>
+                <span>Record All</span>
+            </button>
+            
+            <button onclick="stopAllRecording()" 
+                    class="bg-gray-600 text-white px-4 py-2 rounded-lg shadow-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2">
+                <i class="fas fa-stop"></i>
+                <span>Stop All</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Status Overview -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+        <div class="bg-white rounded-xl p-6 shadow-lg border-l-4 border-blue-500">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm font-medium text-gray-600">Total Cameras</p>
+                    <p class="text-2xl font-bold text-gray-900">{{ cameras|length }}</p>
+                </div>
+                <i class="fas fa-video text-3xl text-blue-500"></i>
+            </div>
+        </div>
+        
+        <div class="bg-white rounded-xl p-6 shadow-lg border-l-4 border-green-500">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm font-medium text-gray-600">Online</p>
+                    <p class="text-2xl font-bold text-gray-900" id="online-count">0</p>
+                </div>
+                <i class="fas fa-check-circle text-3xl text-green-500"></i>
+            </div>
+        </div>
+        
+        <div class="bg-white rounded-xl p-6 shadow-lg border-l-4 border-red-500">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm font-medium text-gray-600">Recording</p>
+                    <p class="text-2xl font-bold text-gray-900" id="recording-count">0</p>
+                </div>
+                <i class="fas fa-record-vinyl text-3xl text-red-500"></i>
+            </div>
+        </div>
+        
+        <div class="bg-white rounded-xl p-6 shadow-lg border-l-4 border-yellow-500">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm font-medium text-gray-600">Offline</p>
+                    <p class="text-2xl font-bold text-gray-900" id="offline-count">0</p>
+                </div>
+                <i class="fas fa-exclamation-triangle text-3xl text-yellow-500"></i>
+            </div>
+        </div>
+    </div>
+
+    <!-- Camera Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
+        {% for i, camera in cameras_with_index %}
+        <div class="bg-white rounded-2xl shadow-xl overflow-hidden card-hover" id="camera-card-{{ i }}">
+            <!-- Camera Header -->
+            <div class="bg-gradient-to-r from-slate-700 to-slate-800 px-6 py-4">
+                <div class="flex justify-between items-center">
+                    <div class="flex items-center space-x-3">
+                        <span class="status-dot status-offline" id="status-dot-{{ i }}"></span>
+                        <h3 class="text-xl font-semibold text-white">{{ camera.name }}</h3>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <span id="recording-indicator-{{ i }}" class="hidden recording-indicator text-xs px-2 py-1 rounded-full text-white font-medium">
+                            <i class="fas fa-circle"></i> REC
+                        </span>
+                        <button onclick="openFullscreen({{ i }})" 
+                                class="text-white hover:text-blue-300 transition-colors duration-200">
+                            <i class="fas fa-expand text-lg"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Camera Stream -->
+            <div class="relative bg-black aspect-video">
+                <img src="{{ url_for('video_feed', camera_id=i) }}" 
+                     alt="Stream from {{ camera.name }}" 
+                     class="w-full h-full object-cover"
+                     id="stream-{{ i }}"
+                     onerror="handleStreamError({{ i }})">
+                
+                <!-- Loading Overlay -->
+                <div id="loading-{{ i }}" class="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                    <div class="text-white text-center">
+                        <i class="fas fa-spinner fa-spin text-3xl mb-2"></i>
+                        <p>Loading stream...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Camera Controls -->
+            <div class="p-6 space-y-4">
+                <!-- Recording Controls -->
+                <div class="flex space-x-2">
+                    <button onclick="toggleRecording({{ i }})" 
+                            id="record-btn-{{ i }}"
+                            class="btn-danger text-white px-4 py-2 rounded-lg flex-1 hover:scale-105 transition-all duration-200 flex items-center justify-center space-x-2">
+                        <i class="fas fa-record-vinyl"></i>
+                        <span>Record</span>
+                    </button>
+                    
+                    <button onclick="takeSnapshot({{ i }})" 
+                            class="btn-success text-white px-4 py-2 rounded-lg flex-1 hover:scale-105 transition-all duration-200 flex items-center justify-center space-x-2">
+                        <i class="fas fa-camera"></i>
+                        <span>Snapshot</span>
+                    </button>
+                </div>
+
+                <!-- Clip Controls -->
+                <div class="grid grid-cols-3 gap-2">
+                    <button onclick="createClip({{ i }}, 15)" 
+                            class="btn-warning text-white px-3 py-2 rounded-lg text-sm hover:scale-105 transition-all duration-200">
+                        <i class="fas fa-film"></i> 15s
+                    </button>
+                    <button onclick="createClip({{ i }}, 30)" 
+                            class="btn-warning text-white px-3 py-2 rounded-lg text-sm hover:scale-105 transition-all duration-200">
+                        <i class="fas fa-film"></i> 30s
+                    </button>
+                    <button onclick="createClip({{ i }}, 60)" 
+                            class="btn-warning text-white px-3 py-2 rounded-lg text-sm hover:scale-105 transition-all duration-200">
+                        <i class="fas fa-film"></i> 60s
+                    </button>
+                </div>
+
+                <!-- Camera Info -->
+                <div class="text-sm text-gray-600 pt-2 border-t">
+                    <div class="flex justify-between">
+                        <span>Status:</span>
+                        <span id="status-text-{{ i }}" class="font-medium">Checking...</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Quality:</span>
+                        <span class="font-medium text-green-600">HD</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Loading Modal -->
+<div id="loading-modal" class="fixed inset-0 bg-black bg-opacity-50 z-50 hidden flex items-center justify-center">
+    <div class="bg-white rounded-lg p-8 max-w-sm mx-4">
+        <div class="text-center">
+            <i class="fas fa-spinner fa-spin text-4xl text-blue-500 mb-4"></i>
+            <p class="text-lg font-medium text-gray-800" id="loading-text">Processing...</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let cameraStatus = {};
+    let recordingState = {{ recording_state|tojson }};
+    
+    // Initialize page
+    document.addEventListener('DOMContentLoaded', function() {
+        updateCameraStatus();
+        setInterval(updateCameraStatus, 5000); // Update every 5 seconds
+        
+        // Hide loading overlays after streams load
+        document.querySelectorAll('[id^="stream-"]').forEach(img => {
+            img.onload = function() {
+                const cameraId = this.id.split('-')[1];
+                document.getElementById(`loading-${cameraId}`).style.display = 'none';
+            };
+        });
+    });
+    
+    // Update camera status
+    async function updateCameraStatus() {
+        try {
+            const response = await fetch('/api/camera_status');
+            cameraStatus = await response.json();
+            
+            let onlineCount = 0;
+            let recordingCount = 0;
+            let offlineCount = 0;
+            
+            for (const [id, status] of Object.entries(cameraStatus)) {
+                const statusDot = document.getElementById(`status-dot-${id}`);
+                const statusText = document.getElementById(`status-text-${id}`);
+                const recordingIndicator = document.getElementById(`recording-indicator-${id}`);
+                const recordBtn = document.getElementById(`record-btn-${id}`);
+                
+                if (status.online) {
+                    onlineCount++;
+                    statusDot.className = 'status-dot status-online';
+                    statusText.textContent = 'Online';
+                    statusText.className = 'font-medium text-green-600';
+                } else {
+                    offlineCount++;
+                    statusDot.className = 'status-dot status-offline';
+                    statusText.textContent = 'Offline';
+                    statusText.className = 'font-medium text-red-600';
+                }
+                
+                if (status.recording) {
+                    recordingCount++;
+                    recordingIndicator.classList.remove('hidden');
+                    recordBtn.innerHTML = '<i class="fas fa-stop"></i><span>Stop</span>';
+                    recordBtn.className = 'bg-gray-600 text-white px-4 py-2 rounded-lg flex-1 hover:scale-105 transition-all duration-200 flex items-center justify-center space-x-2';
+                } else {
+                    recordingIndicator.classList.add('hidden');
+                    recordBtn.innerHTML = '<i class="fas fa-record-vinyl"></i><span>Record</span>';
+                    recordBtn.className = 'btn-danger text-white px-4 py-2 rounded-lg flex-1 hover:scale-105 transition-all duration-200 flex items-center justify-center space-x-2';
+                }
+            }
+            
+            document.getElementById('online-count').textContent = onlineCount;
+            document.getElementById('recording-count').textContent = recordingCount;
+            document.getElementById('offline-count').textContent = offlineCount;
+            
+        } catch (error) {
+            console.error('Failed to update camera status:', error);
+        }
+    }
+    
+    // Handle stream errors
+    function handleStreamError(cameraId) {
+        const img = document.getElementById(`stream-${cameraId}`);
+        const loadingDiv = document.getElementById(`loading-${cameraId}`);
+        
+        loadingDiv.innerHTML = `
+            <div class="text-white text-center">
+                <i class="fas fa-exclamation-triangle text-3xl mb-2 text-red-500"></i>
+                <p>Camera Offline</p>
+            </div>
+        `;
+        
+        // Retry loading after 10 seconds
+        setTimeout(() => {
+            img.src = img.src + '?' + new Date().getTime();
+        }, 10000);
+    }
+    
+    // Show loading modal
+    function showLoading(text = 'Processing...') {
+        document.getElementById('loading-text').textContent = text;
+        document.getElementById('loading-modal').classList.remove('hidden');
+    }
+    
+    // Hide loading modal
+    function hideLoading() {
+        document.getElementById('loading-modal').classList.add('hidden');
+    }
+    
+    // Toggle recording
+    async function toggleRecording(cameraId) {
+        const isRecording = cameraStatus[cameraId]?.recording || false;
+        const endpoint = isRecording ? 'stop_recording' : 'start_recording';
+        
+        showLoading(isRecording ? 'Stopping recording...' : 'Starting recording...');
+        
+        try {
+            const response = await fetch(`/${endpoint}/${cameraId}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(data.message, 'success');
+                updateCameraStatus();
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Network error occurred', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Take snapshot
+    async function takeSnapshot(cameraId) {
+        showLoading('Taking snapshot...');
+        
+        try {
+            const response = await fetch(`/snapshot/${cameraId}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(`Snapshot saved: ${data.filename}`, 'success');
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Failed to take snapshot', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Take all snapshots
+    async function takeAllSnapshots() {
+        showLoading('Taking snapshots from all cameras...');
+        
+        try {
+            const response = await fetch('/snapshot_all');
+            const data = await response.json();
+            
+            if (response.ok) {
+                const successCount = data.results.filter(r => r.status === 'success').length;
+                showNotification(`${successCount} snapshots saved successfully`, 'success');
+            } else {
+                showNotification('Failed to take snapshots', 'error');
+            }
+        } catch (error) {
+            showNotification('Network error occurred', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Start all recording
+    async function startAllRecording() {
+        showLoading('Starting recording on all cameras...');
+        
+        try {
+            const response = await fetch('/start_all_recording');
+            const data = await response.json();
+            
+            if (response.ok) {
+                const successCount = data.results.filter(r => r.status === 'started').length;
+                showNotification(`Recording started on ${successCount} cameras`, 'success');
+                updateCameraStatus();
+            } else {
+                showNotification('Failed to start recording', 'error');
+            }
+        } catch (error) {
+            showNotification('Network error occurred', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Stop all recording
+    async function stopAllRecording() {
+        showLoading('Stopping all recordings...');
+        
+        try {
+            const response = await fetch('/stop_all_recording');
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(data.message, 'success');
+                updateCameraStatus();
+            } else {
+                showNotification('Failed to stop recordings', 'error');
+            }
+        } catch (error) {
+            showNotification('Network error occurred', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Create clip
+    async function createClip(cameraId, duration) {
+        showLoading(`Creating ${duration}s clip...`);
+        
+        try {
+            const response = await fetch(`/clip/${cameraId}/${duration}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(`${duration}s clip created: ${data.filename}`, 'success');
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Failed to create clip', 'error');
+        } finally {
+            hideLoading();
+        }
+    }
+    
+    // Open fullscreen view
+    function openFullscreen(cameraId) {
+        window.open(`/fullscreen/${cameraId}`, '_blank', 'width=1200,height=800');
+    }
+</script>
+{% endblock %}

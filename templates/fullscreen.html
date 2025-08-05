@@ -1,0 +1,341 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ camera.name }} - Fullscreen{% endblock %}
+
+{% block content %}
+<div class="fixed inset-0 bg-black z-40 flex flex-col">
+    <!-- Top Control Bar -->
+    <div class="bg-black bg-opacity-80 text-white p-4 flex justify-between items-center z-50">
+        <div class="flex items-center space-x-4">
+            <button onclick="window.close()" 
+                    class="text-white hover:text-red-400 transition-colors duration-200">
+                <i class="fas fa-times text-xl"></i>
+            </button>
+            <h1 class="text-2xl font-bold">{{ camera.name }}</h1>
+            <span class="status-dot status-offline" id="status-dot"></span>
+            <span id="status-text" class="text-sm">Checking...</span>
+        </div>
+        
+        <div class="flex items-center space-x-4">
+            <div id="clock-full" class="text-sm font-mono"></div>
+            <span id="recording-indicator" class="hidden recording-indicator text-sm px-3 py-1 rounded-full font-medium">
+                <i class="fas fa-circle"></i> RECORDING
+            </span>
+        </div>
+    </div>
+
+    <!-- Main Stream Area -->
+    <div class="flex-1 relative">
+        <img src="{{ url_for('video_feed', camera_id=camera_id) }}" 
+             alt="Stream from {{ camera.name }}" 
+             class="w-full h-full object-contain bg-black"
+             id="main-stream"
+             onerror="handleStreamError()">
+        
+        <!-- Loading Overlay -->
+        <div id="loading-overlay" class="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+            <div class="text-white text-center">
+                <i class="fas fa-spinner fa-spin text-6xl mb-4"></i>
+                <p class="text-xl">Loading stream...</p>
+            </div>
+        </div>
+
+        <!-- Stream Info Overlay -->
+        <div class="absolute bottom-4 left-4 bg-black bg-opacity-70 text-white p-3 rounded-lg">
+            <div class="text-sm space-y-1">
+                <div>Camera: {{ camera.name }}</div>
+                <div>Resolution: <span id="resolution">Loading...</span></div>
+                <div>FPS: <span id="fps">Loading...</span></div>
+                <div>Bitrate: <span id="bitrate">Loading...</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Control Bar -->
+    <div class="bg-black bg-opacity-80 text-white p-4 flex justify-center items-center space-x-6 z-50">
+        <!-- Recording Controls -->
+        <button onclick="toggleRecording()" 
+                id="record-btn"
+                class="btn-danger text-white px-6 py-3 rounded-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2">
+            <i class="fas fa-record-vinyl text-xl"></i>
+            <span class="text-lg font-medium">Record</span>
+        </button>
+        
+        <!-- Snapshot Button -->
+        <button onclick="takeSnapshot()" 
+                class="btn-success text-white px-6 py-3 rounded-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2">
+            <i class="fas fa-camera text-xl"></i>
+            <span class="text-lg font-medium">Snapshot</span>
+        </button>
+        
+        <!-- Clip Buttons -->
+        <div class="flex items-center space-x-2">
+            <span class="text-sm font-medium">Quick Clips:</span>
+            <button onclick="createClip(15)" 
+                    class="btn-warning text-white px-4 py-2 rounded-lg hover:scale-105 transition-all duration-200">
+                <i class="fas fa-film"></i> 15s
+            </button>
+            <button onclick="createClip(30)" 
+                    class="btn-warning text-white px-4 py-2 rounded-lg hover:scale-105 transition-all duration-200">
+                <i class="fas fa-film"></i> 30s
+            </button>
+            <button onclick="createClip(60)" 
+                    class="btn-warning text-white px-4 py-2 rounded-lg hover:scale-105 transition-all duration-200">
+                <i class="fas fa-film"></i> 60s
+            </button>
+        </div>
+
+        <!-- Quality Controls -->
+        <div class="flex items-center space-x-2">
+            <span class="text-sm font-medium">Quality:</span>
+            <select class="bg-gray-700 text-white px-3 py-2 rounded-lg text-sm">
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+            </select>
+        </div>
+
+        <!-- Fullscreen Toggle -->
+        <button onclick="toggleFullscreen()" 
+                class="text-white hover:text-blue-400 transition-colors duration-200 px-4 py-2">
+            <i class="fas fa-expand text-xl"></i>
+        </button>
+    </div>
+</div>
+
+<!-- Notification Area -->
+<div id="notification-area" class="fixed top-20 right-6 z-50 space-y-2"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const cameraId = {{ camera_id }};
+    let cameraStatus = {};
+    let isFullscreen = false;
+    
+    // Initialize
+    document.addEventListener('DOMContentLoaded', function() {
+        updateClock();
+        setInterval(updateClock, 1000);
+        
+        updateCameraStatus();
+        setInterval(updateCameraStatus, 3000);
+        
+        // Hide loading overlay when stream loads
+        document.getElementById('main-stream').onload = function() {
+            document.getElementById('loading-overlay').style.display = 'none';
+            updateStreamInfo();
+        };
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            switch(e.key) {
+                case 'r':
+                case 'R':
+                    toggleRecording();
+                    break;
+                case 's':
+                case 'S':
+                    takeSnapshot();
+                    break;
+                case 'f':
+                case 'F':
+                    toggleFullscreen();
+                    break;
+                case 'Escape':
+                    if (isFullscreen) {
+                        exitFullscreen();
+                    } else {
+                        window.close();
+                    }
+                    break;
+            }
+        });
+    });
+    
+    // Update clock
+    function updateClock() {
+        const now = new Date();
+        const timeString = now.toLocaleString();
+        document.getElementById('clock-full').textContent = timeString;
+    }
+    
+    // Update camera status
+    async function updateCameraStatus() {
+        try {
+            const response = await fetch('/api/camera_status');
+            const allStatus = await response.json();
+            cameraStatus = allStatus[cameraId];
+            
+            if (cameraStatus) {
+                const statusDot = document.getElementById('status-dot');
+                const statusText = document.getElementById('status-text');
+                const recordingIndicator = document.getElementById('recording-indicator');
+                const recordBtn = document.getElementById('record-btn');
+                
+                if (cameraStatus.online) {
+                    statusDot.className = 'status-dot status-online';
+                    statusText.textContent = 'Online';
+                } else {
+                    statusDot.className = 'status-dot status-offline';
+                    statusText.textContent = 'Offline';
+                }
+                
+                if (cameraStatus.recording) {
+                    recordingIndicator.classList.remove('hidden');
+                    recordBtn.innerHTML = '<i class="fas fa-stop text-xl"></i><span class="text-lg font-medium">Stop</span>';
+                    recordBtn.className = 'bg-gray-600 text-white px-6 py-3 rounded-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2';
+                } else {
+                    recordingIndicator.classList.add('hidden');
+                    recordBtn.innerHTML = '<i class="fas fa-record-vinyl text-xl"></i><span class="text-lg font-medium">Record</span>';
+                    recordBtn.className = 'btn-danger text-white px-6 py-3 rounded-lg hover:scale-105 transition-all duration-200 flex items-center space-x-2';
+                }
+            }
+        } catch (error) {
+            console.error('Failed to update camera status:', error);
+        }
+    }
+    
+    // Update stream info
+    function updateStreamInfo() {
+        // Simulated stream info - in real implementation, this would come from the stream
+        document.getElementById('resolution').textContent = '1920x1080';
+        document.getElementById('fps').textContent = '25 FPS';
+        document.getElementById('bitrate').textContent = '2.5 Mbps';
+    }
+    
+    // Handle stream error
+    function handleStreamError() {
+        const overlay = document.getElementById('loading-overlay');
+        overlay.innerHTML = `
+            <div class="text-white text-center">
+                <i class="fas fa-exclamation-triangle text-6xl mb-4 text-red-500"></i>
+                <p class="text-xl">Camera Offline</p>
+                <p class="text-sm mt-2">Attempting to reconnect...</p>
+            </div>
+        `;
+        
+        // Retry loading after 10 seconds
+        setTimeout(() => {
+            const img = document.getElementById('main-stream');
+            img.src = img.src + '?' + new Date().getTime();
+        }, 10000);
+    }
+    
+    // Show notification
+    function showNotification(message, type = 'info') {
+        const notification = document.createElement('div');
+        notification.className = `px-6 py-3 rounded-lg shadow-lg text-white transition-all duration-300 transform translate-x-full`;
+        
+        switch(type) {
+            case 'success':
+                notification.classList.add('bg-green-500');
+                break;
+            case 'error':
+                notification.classList.add('bg-red-500');
+                break;
+            case 'warning':
+                notification.classList.add('bg-yellow-500');
+                break;
+            default:
+                notification.classList.add('bg-blue-500');
+        }
+        
+        notification.innerHTML = `
+            <div class="flex items-center space-x-2">
+                <i class="fas fa-${type === 'success' ? 'check' : type === 'error' ? 'exclamation' : 'info'}-circle"></i>
+                <span>${message}</span>
+            </div>
+        `;
+        
+        document.getElementById('notification-area').appendChild(notification);
+        
+        // Animate in
+        setTimeout(() => {
+            notification.classList.remove('translate-x-full');
+        }, 100);
+        
+        // Remove after 5 seconds
+        setTimeout(() => {
+            notification.classList.add('translate-x-full');
+            setTimeout(() => {
+                notification.remove();
+            }, 300);
+        }, 5000);
+    }
+    
+    // Toggle recording
+    async function toggleRecording() {
+        const isRecording = cameraStatus?.recording || false;
+        const endpoint = isRecording ? 'stop_recording' : 'start_recording';
+        
+        try {
+            const response = await fetch(`/${endpoint}/${cameraId}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(data.message, 'success');
+                updateCameraStatus();
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Network error occurred', 'error');
+        }
+    }
+    
+    // Take snapshot
+    async function takeSnapshot() {
+        try {
+            const response = await fetch(`/snapshot/${cameraId}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(`Snapshot saved: ${data.filename}`, 'success');
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Failed to take snapshot', 'error');
+        }
+    }
+    
+    // Create clip
+    async function createClip(duration) {
+        showNotification(`Creating ${duration}s clip...`, 'info');
+        
+        try {
+            const response = await fetch(`/clip/${cameraId}/${duration}`);
+            const data = await response.json();
+            
+            if (response.ok) {
+                showNotification(`${duration}s clip created: ${data.filename}`, 'success');
+            } else {
+                showNotification(data.error, 'error');
+            }
+        } catch (error) {
+            showNotification('Failed to create clip', 'error');
+        }
+    }
+    
+    // Toggle fullscreen
+    function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen().then(() => {
+                isFullscreen = true;
+            });
+        } else {
+            exitFullscreen();
+        }
+    }
+    
+    // Exit fullscreen
+    function exitFullscreen() {
+        if (document.exitFullscreen) {
+            document.exitFullscreen().then(() => {
+                isFullscreen = false;
+            });
+        }
+    }
+</script>
+{% endblock %}

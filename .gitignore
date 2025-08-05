@@ -1,0 +1,48 @@
+# Python
+*.pyc
+*.pyo
+__pycache__/
+
+# Flask
+instance/
+*.db
+*.sqlite3
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+
+# OS-specific files
+.DS_Store
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+*.mpeg
+
+# Environment variables
+.env
+*.env
+*.env.*
+
+# Test and coverage
+.coverage
+*.cover
+nosetests.xml
+test-reports/
+
+# Logs
+*.log
+
+# Dependency directories
+venv/
+env/
