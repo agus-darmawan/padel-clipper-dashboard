@@ -11,6 +11,7 @@ from functools import wraps
 import socket
 import requests
 from collections import deque
+import subprocess
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -33,6 +34,7 @@ os.makedirs('snapshots', exist_ok=True)
 os.makedirs('clips', exist_ok=True)
 os.makedirs('recordings', exist_ok=True)
 os.makedirs('test_uploads', exist_ok=True)
+os.makedirs('temp_clips', exist_ok=True)  # For temporary AVI files before conversion
 
 try:
     from config import CAMERAS, DEFAULT_USERNAME, DEFAULT_PASSWORD
@@ -41,10 +43,10 @@ try:
     default_password = DEFAULT_PASSWORD
 except ImportError:
     cameras = [
-        {"name": "Front Door", "url": "rtsp://admin:ZESFRO@192.168.1.127:554/stream1", "lapangan": 1},
-        {"name": "Back Yard", "url": "rtsp://admin:ZESFRO@192.168.1.128:554/stream1", "lapangan": 2},
-        {"name": "Garage", "url": "rtsp://admin:ZESFRO@192.168.1.129:110/stream1", "lapangan": 3},
-        {"name": "Living Room", "url": "rtsp://admin:ZESFRO@192.168.1.130:554/stream1", "lapangan": 4}
+        {"name": "Lapangan 1 Kiri", "url": "rtsp://admin:ZESFRO@192.168.1.127:554/stream1", "lapangan": 1},
+        {"name": "Lapangan 1 Kanan", "url": "rtsp://admin:Josephwijaya34@192.168.1.154:554/stream1", "lapangan": 1},
+        {"name": "Lapangan 2 Kiri", "url": "rtsp://admin:Josephwijaya34@192.168.1.155:554/stream1", "lapangan": 2},
+        {"name": "Lapangan 2 Kanan", "url": "rtsp://admin:Josephwijaya34@192.168.1.156:554/stream1", "lapangan": 2}
     ]
     default_username = "admin"
     default_password = "admin123"
@@ -57,6 +59,53 @@ def create_error_frame():
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     cv2.putText(frame, "Camera Offline", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
     return frame
+
+def check_ffmpeg():
+    """Check if FFmpeg is available"""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def convert_to_mp4(input_file, output_file):
+    """Convert video file to MP4 using FFmpeg"""
+    try:
+        if not check_ffmpeg():
+            print("[CONVERT ERROR] FFmpeg not found. Installing FFmpeg is recommended for better MP4 support.")
+            return False
+            
+        cmd = [
+            'ffmpeg', '-i', input_file,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-y',  # Overwrite output file
+            output_file
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"[CONVERT SUCCESS] Successfully converted {input_file} to {output_file}")
+            # Remove temporary file
+            if os.path.exists(input_file) and input_file != output_file:
+                os.remove(input_file)
+            return True
+        else:
+            print(f"[CONVERT ERROR] FFmpeg failed: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"[CONVERT ERROR] Exception during conversion: {e}")
+        return False
+
+def get_cameras_by_court(court_id):
+    """Get all cameras that belong to a specific court/lapangan"""
+    matching_cameras = []
+    for i, cam_info in enumerate(cameras):
+        if cam_info.get('lapangan') == court_id:
+            matching_cameras.append((i, cam_info))
+    return matching_cameras
 
 # --- KELAS KAMERA YANG DIOPTIMALKAN ---
 class AdvancedCamera:
@@ -75,7 +124,7 @@ class AdvancedCamera:
         self.capture_thread.start()
 
     def _capture_loop(self):
-        """Loop yang diperbarui untuk mendukung MP4"""
+        """Improved capture loop with better MP4 handling"""
         cap = None
         cctv_writer = None
         cctv_end_time = 0
@@ -111,21 +160,25 @@ class AdvancedCamera:
                 with self.buffer_lock:
                     self.buffer.append(frame)
 
-                # 4. LOGIKA REKAMAN CCTV - GUNAKAN MP4 LANGSUNG
+                # 4. LOGIKA REKAMAN CCTV - Use AVI first, then convert to MP4
                 if cctv_writer is None or time.time() > cctv_end_time:
                     if cctv_writer is not None:
                         cctv_writer.release()
                         print(f"[CCTV FINISHED] Segmen rekaman sebelumnya untuk kamera ID {self.camera_id} selesai.")
                     
                     height, width, _ = frame.shape
-                    # PERBAIKAN: Gunakan codec MP4 langsung
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau gunakan 'avc1' untuk H.264
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use XVID for reliable recording
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # PERBAIKAN: Ganti ekstensi ke .mp4
-                    filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.mp4"
-                    cctv_writer = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+                    temp_filename = f"temp_clips/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.avi"
+                    final_filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.mp4"
+                    
+                    cctv_writer = cv2.VideoWriter(temp_filename, fourcc, self.fps, (width, height))
                     cctv_end_time = time.time() + CCTV_CHUNK_MINUTES * 60
-                    print(f"[CCTV STARTED] Mulai merekam segmen MP4 baru untuk kamera ID {self.camera_id} ke file {filename}")
+                    print(f"[CCTV STARTED] Mulai merekam segmen untuk kamera ID {self.camera_id} ke file {temp_filename}")
+                    
+                    # Schedule conversion to MP4 when recording ends
+                    self.current_temp_file = temp_filename
+                    self.current_final_file = final_filename
 
                 cctv_writer.write(frame)
 
@@ -134,7 +187,7 @@ class AdvancedCamera:
                 time.sleep(10)
 
     def create_pre_event_clip(self, requested_duration):
-        """Fungsi yang diperbarui untuk membuat klip MP4"""
+        """Create clip with proper MP4 conversion"""
         if not self.is_online or not self.buffer:
             print(f"[CLIP ERROR] Tidak bisa membuat klip, kamera ID {self.camera_id} sedang offline atau buffer kosong.")
             return
@@ -143,7 +196,7 @@ class AdvancedCamera:
             print(f"[CLIP WARNING] Durasi {requested_duration}s melebihi buffer. Dibatasi menjadi {MAX_PRE_EVENT_SECONDS}s.")
             requested_duration = MAX_PRE_EVENT_SECONDS
 
-        print(f"[CLIP] Memulai pembuatan klip MP4 {requested_duration}s (Pre-Event) untuk kamera ID {self.camera_id}")
+        print(f"[CLIP] Memulai pembuatan klip {requested_duration}s (Pre-Event) untuk kamera ID {self.camera_id}")
         
         all_frames = []
         with self.buffer_lock:
@@ -155,36 +208,40 @@ class AdvancedCamera:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # PERBAIKAN: Langsung buat file MP4
-        filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.mp4"
+        
+        # Create temporary AVI file first
+        temp_filename = f"temp_clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.avi"
+        final_filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.mp4"
         
         height, width, _ = all_frames[0].shape
-        # PERBAIKAN: Gunakan codec MP4
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau 'avc1' untuk H.264
-        out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use reliable XVID codec
+        out = cv2.VideoWriter(temp_filename, fourcc, self.fps, (width, height))
         
         if not out.isOpened():
-            print(f"[CLIP ERROR] Gagal membuka video writer untuk {filename}")
-            # Fallback ke codec lain jika mp4v gagal
-            print("[CLIP] Mencoba codec alternatif...")
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264
-            out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
-            
-            if not out.isOpened():
-                print("[CLIP ERROR] Semua codec gagal. Menggunakan fallback AVI.")
-                filename = filename.replace('.mp4', '.avi')
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+            print(f"[CLIP ERROR] Gagal membuka video writer untuk {temp_filename}")
+            return
         
         for frame in all_frames:
             out.write(frame)
         
         out.release()
-        print(f"[CLIP FINISHED] Klip berhasil disimpan: {filename}")
+        print(f"[CLIP] Temporary AVI file created: {temp_filename}")
         
+        # Convert to MP4
+        if convert_to_mp4(temp_filename, final_filename):
+            filename_to_upload = final_filename
+            print(f"[CLIP SUCCESS] MP4 clip berhasil dibuat: {final_filename}")
+        else:
+            # If conversion fails, use the AVI file but rename it
+            fallback_filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.avi"
+            os.rename(temp_filename, fallback_filename)
+            filename_to_upload = fallback_filename
+            print(f"[CLIP FALLBACK] Using AVI format: {fallback_filename}")
+        
+        # Upload the clip
         upload_thread = threading.Thread(
             target=upload_clip_task, 
-            args=(filename, self.cam_info.get('name', 'N/A'), self.cam_info.get('lapangan', 0), datetime.now().isoformat())
+            args=(filename_to_upload, self.cam_info.get('name', 'N/A'), self.cam_info.get('lapangan', 0), datetime.now().isoformat())
         )
         upload_thread.daemon = True
         upload_thread.start()
@@ -192,9 +249,54 @@ class AdvancedCamera:
 # Inisialisasi semua kamera
 advanced_cameras = {i: AdvancedCamera(i, cam_info) for i, cam_info in enumerate(cameras)}
 
+# --- FUNGSI UNTUK MULTI-CAMERA CLIPPING ---
+def create_clips_for_court(court_id, duration=15):
+    """Create clips for all cameras in a specific court"""
+    matching_cameras = get_cameras_by_court(court_id)
+    
+    if not matching_cameras:
+        print(f"[MULTI-CLIP WARNING] Tidak ada kamera ditemukan untuk lapangan {court_id}")
+        return {"success": False, "message": f"No cameras found for court {court_id}"}
+    
+    print(f"[MULTI-CLIP] Memulai pembuatan klip untuk lapangan {court_id}. Kamera ditemukan: {len(matching_cameras)}")
+    
+    clip_threads = []
+    results = []
+    
+    for camera_id, cam_info in matching_cameras:
+        if camera_id in advanced_cameras:
+            print(f"[MULTI-CLIP] Memicu klip untuk kamera ID {camera_id} ({cam_info['name']})")
+            
+            clip_thread = threading.Thread(
+                target=advanced_cameras[camera_id].create_pre_event_clip,
+                args=(duration,)
+            )
+            clip_thread.daemon = True
+            clip_thread.start()
+            clip_threads.append(clip_thread)
+            
+            results.append({
+                "camera_id": camera_id,
+                "camera_name": cam_info['name'],
+                "status": "started"
+            })
+        else:
+            print(f"[MULTI-CLIP WARNING] Kamera ID {camera_id} tidak tersedia")
+            results.append({
+                "camera_id": camera_id,
+                "camera_name": cam_info['name'],
+                "status": "unavailable"
+            })
+    
+    return {
+        "success": True,
+        "message": f"Started clip creation for {len(clip_threads)} cameras in court {court_id}",
+        "cameras": results
+    }
+
 # --- FUNGSI UPLOAD & LISTENER UDP ---
 def upload_clip_task(filename, camera_name, lapangan, start_time):
-    """Mengirim file video dan metadata ke endpoint API - FIXED VERSION."""
+    """Mengirim file video dan metadata ke endpoint API"""
     try:
         if not os.path.exists(filename):
             print(f"[UPLOAD ERROR] File tidak ditemukan: {filename}")
@@ -253,7 +355,7 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
         # 2. Buat booking hour untuk clip ini
         print(f"[UPLOAD] Creating booking hour for court {court_id}")
         booking_payload = {
-            "courtId": int(court_id),  # Ensure it's an integer
+            "courtId": int(court_id),
             "dateStart": start_time,
             "dateEnd": (datetime.fromisoformat(start_time.replace('Z', '+00:00') if start_time.endswith('Z') else start_time) + timedelta(minutes=15)).isoformat()
         }
@@ -283,11 +385,10 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
             
         print(f"[UPLOAD INFO] Booking hour created with ID: {booking_hour_id}")
 
-        # 3. Upload video clip - Check file type first
+        # 3. Upload video clip
         file_size = os.path.getsize(filename)
         print(f"[UPLOAD INFO] File size: {file_size} bytes")
         
-        # Check if file is too large (adjust limit as needed)
         if file_size > 100 * 1024 * 1024:  # 100MB limit
             print(f"[UPLOAD ERROR] File too large: {file_size} bytes")
             return
@@ -295,27 +396,21 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
         with open(filename, 'rb') as f:
             clip_name = os.path.basename(filename)
             
-            # Try different MIME types based on file extension
+            # Determine MIME type based on file extension
             file_ext = os.path.splitext(filename)[1].lower()
-            if file_ext == '.avi':
-                mime_type = 'video/x-msvideo'
-            elif file_ext == '.mp4':
+            if file_ext == '.mp4':
                 mime_type = 'video/mp4'
+            elif file_ext == '.avi':
+                mime_type = 'video/x-msvideo'
             elif file_ext == '.webm':
                 mime_type = 'video/webm'
             else:
-                mime_type = 'video/avi'  # fallback
+                mime_type = 'video/mp4'  # default to mp4
             
             files = {'video': (clip_name, f, mime_type)}
+            payload = {'bookingHourId': str(booking_hour_id)}
             
-            # Send only bookingHourId as required by your TypeScript controller
-            payload = {
-                'bookingHourId': str(booking_hour_id)
-            }
-            
-            print(f"[UPLOAD DEBUG] Endpoint: {CLIP_UPLOAD_ENDPOINT}")
-            print(f"[UPLOAD DEBUG] Payload: {payload}")
-            print(f"[UPLOAD DEBUG] File: {clip_name} ({mime_type})")
+            print(f"[UPLOAD DEBUG] Uploading {clip_name} ({mime_type})")
             
             try:
                 response = requests.post(
@@ -325,34 +420,15 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
                     timeout=120
                 )
                 
-                print(f"[UPLOAD DEBUG] Upload response status: {response.status_code}")
-                print(f"[UPLOAD DEBUG] Upload response headers: {dict(response.headers)}")
-                
                 if response.status_code in [200, 201]:
                     print(f"[UPLOAD SUCCESS] Successfully uploaded {filename}")
-                    print(f"[UPLOAD SUCCESS] Response: {response.text}")
-                    
                     # Optionally delete local file after successful upload
                     # os.remove(filename)
-                    # print(f"[CLEANUP] Local file {filename} deleted")
-                    
                 else:
                     print(f"[UPLOAD FAILED] Failed to upload {filename}")
                     print(f"[UPLOAD FAILED] Status: {response.status_code}")
                     print(f"[UPLOAD FAILED] Response: {response.text}")
-                    
-                    # Save response for debugging
-                    with open(f"debug_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", 'w') as debug_file:
-                        debug_file.write(f"Status: {response.status_code}\n")
-                        debug_file.write(f"Headers: {dict(response.headers)}\n")
-                        debug_file.write(f"Response: {response.text}\n")
-                        debug_file.write(f"Request URL: {CLIP_UPLOAD_ENDPOINT}\n")
-                        debug_file.write(f"Request payload: {payload}\n")
                         
-            except requests.exceptions.Timeout:
-                print(f"[UPLOAD ERROR] Timeout while uploading {filename}")
-            except requests.exceptions.ConnectionError:
-                print(f"[UPLOAD ERROR] Cannot connect to API server")
             except requests.exceptions.RequestException as e:
                 print(f"[UPLOAD ERROR] Request exception: {e}")
 
@@ -363,29 +439,39 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
 
 def udp_listener():
     UDP_IP = "0.0.0.0"
-    UDP_PORT = 12345
+    UDP_PORT = 8888
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
     print(f"✅ Server UDP aktif, mendengarkan di port {UDP_PORT}...")
     while True:
         try:
             data, addr = sock.recvfrom(1024)
-            message = data.decode('utf-8')
+            message = data.decode('utf-8').strip()
             print(f"\n[UDP RECEIVED] Pesan diterima dari {addr}: {message}")
-            if message == "CREATE_CLIP":
-                camera_to_record = 0 
-                clip_duration = 15
-                print(f"➡️  Aksi: Memicu klip pre-event {clip_duration} detik dari kamera ID {camera_to_record}.")
-                clip_thread = threading.Thread(target=advanced_cameras[camera_to_record].create_pre_event_clip, args=(clip_duration,))
-                clip_thread.start()
-                response = f"ACK: Pre-event clip started for camera {camera_to_record}"
+
+            try:
+                court_number = int(message)
+                result = create_clips_for_court(court_number, 15)
+                
+                if result["success"]:
+                    print(f"➡️  Aksi: {result['message']}")
+                    response = f"ACK: {result['message']}"
+                    sock.sendto(response.encode('utf-8'), addr)
+                else:
+                    print(f"[UDP WARNING] {result['message']}")
+                    response = f"ERROR: {result['message']}"
+                    sock.sendto(response.encode('utf-8'), addr)
+
+            except ValueError:
+                print(f"[UDP INFO] Pesan tidak dikenali atau bukan nomor lapangan: '{message}'")
+                response = f"NACK: Unknown command '{message}'. Expected a court number."
                 sock.sendto(response.encode('utf-8'), addr)
         except Exception as e:
             print(f"[UDP ERROR] Terjadi error di listener UDP: {e}")
 
 # --- RUTE-RUTE FLASK ---
 def generate_frame(camera_id):
-    """Mengambil frame terakhir dari buffer, bukan membuka koneksi baru."""
+    """Mengambil frame terakhir dari buffer"""
     while True:
         frame = advanced_cameras[camera_id].last_frame
         ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -406,8 +492,6 @@ def login_required(f):
 @app.template_filter('enumerate')
 def enumerate_filter(iterable):
     return enumerate(iterable)
-
-# Endpoint dummy /api/test_upload di-nonaktifkan karena upload diarahkan ke backend Go
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -448,15 +532,32 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+@app.route('/fullscreen/<int:camera_id>')
+@login_required
+def fullscreen(camera_id):
+    if camera_id >= len(cameras):
+        return redirect(url_for('index'))
+    return render_template('fullscreen.html', camera=cameras[camera_id], camera_id=camera_id)
+
 @app.route('/')
 @login_required
 def index():
     cameras_with_index = list(enumerate(cameras))
     current_recording_state = {i: True for i in range(len(cameras))}
+    
+    # Group cameras by court for display
+    courts_data = {}
+    for i, cam_info in enumerate(cameras):
+        court_id = cam_info.get('lapangan', 0)
+        if court_id not in courts_data:
+            courts_data[court_id] = []
+        courts_data[court_id].append((i, cam_info))
+    
     return render_template('index.html', 
                          cameras=cameras, 
                          cameras_with_index=cameras_with_index,
-                         recording_state=current_recording_state)
+                         recording_state=current_recording_state,
+                         courts_data=courts_data)
 
 @app.route('/video_feed/<int:camera_id>')
 def video_feed(camera_id):
@@ -477,6 +578,18 @@ def clip(camera_id, duration=15):
     clip_thread.start()
     
     return jsonify({"message": f"Pre-event clip creation for {duration}s has been started."})
+
+# NEW: Multi-camera clip endpoint
+@app.route('/clip_court/<int:court_id>/<int:duration>')
+@login_required
+def clip_court(court_id, duration=15):
+    """Create clips for all cameras in a specific court"""
+    result = create_clips_for_court(court_id, duration)
+    
+    if result["success"]:
+        return jsonify(result)
+    else:
+        return jsonify(result), 404
 
 @app.route('/snapshot/<int:camera_id>')
 @login_required
@@ -510,17 +623,26 @@ def snapshot_all():
             results.append({"camera": camera["name"], "status": "failed"})
         cap.release()
     return jsonify({"message": "Batch snapshot completed", "results": results})
+
 if __name__ == '__main__':
+    # Check if FFmpeg is available
+    if check_ffmpeg():
+        print("✅ FFmpeg detected - MP4 conversion will be used")
+    else:
+        print("⚠️  FFmpeg not found - clips will be saved as AVI files")
+        print("   To install FFmpeg: https://ffmpeg.org/download.html")
+    
     listener_thread = threading.Thread(target=udp_listener, daemon=True)
     listener_thread.start()
     
     print("🎥 Advanced RTSP Camera Surveillance System")
     print("=" * 50)
     print("📋 Features:")
-    print("   • Pre-event clip recording (on-demand)")
-    print("   • Continuous CCTV recording (30-min chunks)")
-    print("   • Auto-upload clips to an endpoint")
-    print("   • Secure authentication & Live View")
+    print("   • Pre-event clip recording (single camera & multi-camera)")
+    print("   • Proper MP4 conversion with FFmpeg")
+    print("   • Continuous CCTV recording")
+    print("   • Auto-upload clips to API endpoint")
+    print("   • Multi-camera clipping per court")
     print()
     print("🔐 Default Login:")
     print(f"   Username: {default_username}")
@@ -530,5 +652,4 @@ if __name__ == '__main__':
     print("   Access at: http://127.0.0.1:5001")
     print("=" * 50)
     
-    # use_reloader=False penting untuk mencegah thread berjalan dua kali dalam mode debug
     app.run(debug=True, host='0.0.0.0', port=5001, threaded=True, use_reloader=False)
