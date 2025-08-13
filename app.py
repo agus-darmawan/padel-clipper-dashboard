@@ -11,6 +11,8 @@ from functools import wraps
 import socket
 import requests
 from collections import deque
+import subprocess
+import glob
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -26,6 +28,10 @@ BOOKING_HOURS_ENDPOINT = f"{API_BASE_URL}/booking-hours"
 MAX_PRE_EVENT_SECONDS = 15
 CCTV_CHUNK_MINUTES = 10 # Durasi setiap file rekaman CCTV berkelanjutan
 
+# Konfigurasi cleanup - hapus file lokal yang lebih dari 3 hari
+CLEANUP_DAYS = 3
+CLEANUP_INTERVAL_HOURS = 6  # Jalankan cleanup setiap 6 jam
+
 ALLOWED_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/ogg']
 
 # --- DIREKTORI & KONFIGURASI KAMERA ---
@@ -33,6 +39,7 @@ os.makedirs('snapshots', exist_ok=True)
 os.makedirs('clips', exist_ok=True)
 os.makedirs('recordings', exist_ok=True)
 os.makedirs('test_uploads', exist_ok=True)
+os.makedirs('temp_clips', exist_ok=True)  # For temporary AVI files before conversion
 
 try:
     from config import CAMERAS, DEFAULT_USERNAME, DEFAULT_PASSWORD
@@ -41,10 +48,10 @@ try:
     default_password = DEFAULT_PASSWORD
 except ImportError:
     cameras = [
-        {"name": "Front Door", "url": "rtsp://admin:ZESFRO@192.168.1.127:554/stream1", "lapangan": 1},
-        {"name": "Back Yard", "url": "rtsp://admin:ZESFRO@192.168.1.128:554/stream1", "lapangan": 2},
-        {"name": "Garage", "url": "rtsp://admin:ZESFRO@192.168.1.129:110/stream1", "lapangan": 3},
-        {"name": "Living Room", "url": "rtsp://admin:ZESFRO@192.168.1.130:554/stream1", "lapangan": 4}
+        {"name": "Lapangan 1 Kiri", "url": "rtsp://admin:ZESFRO@192.168.1.127:554/stream1", "lapangan": 1},
+        {"name": "Lapangan 1 Kanan", "url": "rtsp://admin:Josephwijaya34@192.168.1.154:554/stream1", "lapangan": 1},
+        {"name": "Lapangan 2 Kiri", "url": "rtsp://admin:Josephwijaya34@192.168.1.155:554/stream1", "lapangan": 2},
+        {"name": "Lapangan 2 Kanan", "url": "rtsp://admin:Josephwijaya34@192.168.1.156:554/stream1", "lapangan": 2}
     ]
     default_username = "admin"
     default_password = "admin123"
@@ -57,6 +64,170 @@ def create_error_frame():
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     cv2.putText(frame, "Camera Offline", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
     return frame
+
+def check_ffmpeg():
+    """Check if FFmpeg is available"""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def convert_to_mp4(input_file, output_file):
+    """Convert video file to MP4 using FFmpeg"""
+    try:
+        if not check_ffmpeg():
+            print("[CONVERT ERROR] FFmpeg not found. Installing FFmpeg is recommended for better MP4 support.")
+            return False
+            
+        cmd = [
+            'ffmpeg', '-i', input_file,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-y',  # Overwrite output file
+            output_file
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"[CONVERT SUCCESS] Successfully converted {input_file} to {output_file}")
+            # Remove temporary file
+            if os.path.exists(input_file) and input_file != output_file:
+                os.remove(input_file)
+            return True
+        else:
+            print(f"[CONVERT ERROR] FFmpeg failed: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"[CONVERT ERROR] Exception during conversion: {e}")
+        return False
+
+def get_cameras_by_court(court_id):
+    """Get all cameras that belong to a specific court/lapangan"""
+    matching_cameras = []
+    for i, cam_info in enumerate(cameras):
+        if cam_info.get('lapangan') == court_id:
+            matching_cameras.append((i, cam_info))
+    return matching_cameras
+
+def cleanup_old_files():
+    """
+    Hapus file lokal yang lebih tua dari CLEANUP_DAYS hari
+    Mencakup semua direktori penyimpanan: clips, recordings, snapshots, temp_clips, test_uploads
+    """
+    try:
+        print(f"[CLEANUP] Memulai pembersihan file yang lebih dari {CLEANUP_DAYS} hari...")
+        
+        # Direktori yang akan dibersihkan
+        directories_to_clean = [
+            'clips',
+            'recordings', 
+            'snapshots',
+            'temp_clips',
+            'test_uploads'
+        ]
+        
+        # Waktu batas (3 hari yang lalu)
+        cutoff_time = time.time() - (CLEANUP_DAYS * 24 * 60 * 60)
+        
+        total_deleted = 0
+        total_size_freed = 0
+        
+        for directory in directories_to_clean:
+            if not os.path.exists(directory):
+                continue
+                
+            print(f"[CLEANUP] Memeriksa direktori: {directory}")
+            deleted_count = 0
+            size_freed = 0
+            
+            # Cari semua file dalam direktori
+            pattern = os.path.join(directory, '*')
+            files = glob.glob(pattern)
+            
+            for file_path in files:
+                if os.path.isfile(file_path):
+                    try:
+                        # Cek waktu modifikasi file
+                        file_mtime = os.path.getmtime(file_path)
+                        
+                        if file_mtime < cutoff_time:
+                            # File lebih lama dari batas waktu, hapus
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            
+                            deleted_count += 1
+                            size_freed += file_size
+                            
+                            # Konversi ukuran ke format yang mudah dibaca
+                            if file_size < 1024:
+                                size_str = f"{file_size} B"
+                            elif file_size < 1024 * 1024:
+                                size_str = f"{file_size/1024:.1f} KB"
+                            else:
+                                size_str = f"{file_size/(1024*1024):.1f} MB"
+                                
+                            print(f"[CLEANUP] Menghapus: {os.path.basename(file_path)} ({size_str})")
+                            
+                    except Exception as e:
+                        print(f"[CLEANUP ERROR] Gagal menghapus {file_path}: {e}")
+            
+            if deleted_count > 0:
+                if size_freed < 1024:
+                    size_str = f"{size_freed} B"
+                elif size_freed < 1024 * 1024:
+                    size_str = f"{size_freed/1024:.1f} KB"
+                else:
+                    size_str = f"{size_freed/(1024*1024):.1f} MB"
+                    
+                print(f"[CLEANUP] Direktori {directory}: {deleted_count} file dihapus, {size_str} ruang dibebaskan")
+            else:
+                print(f"[CLEANUP] Direktori {directory}: Tidak ada file lama yang perlu dihapus")
+            
+            total_deleted += deleted_count
+            total_size_freed += size_freed
+        
+        # Summary
+        if total_size_freed < 1024:
+            total_size_str = f"{total_size_freed} B"
+        elif total_size_freed < 1024 * 1024:
+            total_size_str = f"{total_size_freed/1024:.1f} KB"
+        elif total_size_freed < 1024 * 1024 * 1024:
+            total_size_str = f"{total_size_freed/(1024*1024):.1f} MB"
+        else:
+            total_size_str = f"{total_size_freed/(1024*1024*1024):.1f} GB"
+            
+        print(f"[CLEANUP SUCCESS] Total: {total_deleted} file dihapus, {total_size_str} ruang disk dibebaskan")
+        
+        if total_deleted == 0:
+            print("[CLEANUP] Tidak ada file lama yang perlu dibersihkan")
+        
+    except Exception as e:
+        print(f"[CLEANUP ERROR] Error saat membersihkan file: {e}")
+        import traceback
+        traceback.print_exc()
+
+def cleanup_scheduler():
+    """
+    Thread daemon yang menjalankan cleanup secara berkala
+    Berjalan setiap CLEANUP_INTERVAL_HOURS jam
+    """
+    print(f"[CLEANUP SCHEDULER] Memulai scheduler pembersihan otomatis setiap {CLEANUP_INTERVAL_HOURS} jam")
+    
+    # Jalankan cleanup pertama kali setelah 1 menit (untuk memberikan waktu sistem untuk start)
+    time.sleep(60)
+    cleanup_old_files()
+    
+    # Lalu jalankan setiap interval yang ditentukan
+    while True:
+        try:
+            time.sleep(CLEANUP_INTERVAL_HOURS * 60 * 60)  # Konversi jam ke detik
+            cleanup_old_files()
+        except Exception as e:
+            print(f"[CLEANUP SCHEDULER ERROR] Error dalam scheduler: {e}")
+            time.sleep(300)  # Wait 5 minutes before retrying
 
 # --- KELAS KAMERA YANG DIOPTIMALKAN ---
 class AdvancedCamera:
@@ -75,7 +246,7 @@ class AdvancedCamera:
         self.capture_thread.start()
 
     def _capture_loop(self):
-        """Loop yang diperbarui untuk mendukung MP4"""
+        """Improved capture loop with better MP4 handling"""
         cap = None
         cctv_writer = None
         cctv_end_time = 0
@@ -111,21 +282,25 @@ class AdvancedCamera:
                 with self.buffer_lock:
                     self.buffer.append(frame)
 
-                # 4. LOGIKA REKAMAN CCTV - GUNAKAN MP4 LANGSUNG
+                # 4. LOGIKA REKAMAN CCTV - Use AVI first, then convert to MP4
                 if cctv_writer is None or time.time() > cctv_end_time:
                     if cctv_writer is not None:
                         cctv_writer.release()
                         print(f"[CCTV FINISHED] Segmen rekaman sebelumnya untuk kamera ID {self.camera_id} selesai.")
                     
                     height, width, _ = frame.shape
-                    # PERBAIKAN: Gunakan codec MP4 langsung
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau gunakan 'avc1' untuk H.264
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use XVID for reliable recording
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # PERBAIKAN: Ganti ekstensi ke .mp4
-                    filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.mp4"
-                    cctv_writer = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+                    temp_filename = f"temp_clips/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.avi"
+                    final_filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.mp4"
+                    
+                    cctv_writer = cv2.VideoWriter(temp_filename, fourcc, self.fps, (width, height))
                     cctv_end_time = time.time() + CCTV_CHUNK_MINUTES * 60
-                    print(f"[CCTV STARTED] Mulai merekam segmen MP4 baru untuk kamera ID {self.camera_id} ke file {filename}")
+                    print(f"[CCTV STARTED] Mulai merekam segmen untuk kamera ID {self.camera_id} ke file {temp_filename}")
+                    
+                    # Schedule conversion to MP4 when recording ends
+                    self.current_temp_file = temp_filename
+                    self.current_final_file = final_filename
 
                 cctv_writer.write(frame)
 
@@ -134,7 +309,7 @@ class AdvancedCamera:
                 time.sleep(10)
 
     def create_pre_event_clip(self, requested_duration):
-        """Fungsi yang diperbarui untuk membuat klip MP4"""
+        """Create clip with proper MP4 conversion"""
         if not self.is_online or not self.buffer:
             print(f"[CLIP ERROR] Tidak bisa membuat klip, kamera ID {self.camera_id} sedang offline atau buffer kosong.")
             return
@@ -143,7 +318,7 @@ class AdvancedCamera:
             print(f"[CLIP WARNING] Durasi {requested_duration}s melebihi buffer. Dibatasi menjadi {MAX_PRE_EVENT_SECONDS}s.")
             requested_duration = MAX_PRE_EVENT_SECONDS
 
-        print(f"[CLIP] Memulai pembuatan klip MP4 {requested_duration}s (Pre-Event) untuk kamera ID {self.camera_id}")
+        print(f"[CLIP] Memulai pembuatan klip {requested_duration}s (Pre-Event) untuk kamera ID {self.camera_id}")
         
         all_frames = []
         with self.buffer_lock:
@@ -155,36 +330,40 @@ class AdvancedCamera:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # PERBAIKAN: Langsung buat file MP4
-        filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.mp4"
+        
+        # Create temporary AVI file first
+        temp_filename = f"temp_clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.avi"
+        final_filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.mp4"
         
         height, width, _ = all_frames[0].shape
-        # PERBAIKAN: Gunakan codec MP4
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau 'avc1' untuk H.264
-        out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use reliable XVID codec
+        out = cv2.VideoWriter(temp_filename, fourcc, self.fps, (width, height))
         
         if not out.isOpened():
-            print(f"[CLIP ERROR] Gagal membuka video writer untuk {filename}")
-            # Fallback ke codec lain jika mp4v gagal
-            print("[CLIP] Mencoba codec alternatif...")
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264
-            out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
-            
-            if not out.isOpened():
-                print("[CLIP ERROR] Semua codec gagal. Menggunakan fallback AVI.")
-                filename = filename.replace('.mp4', '.avi')
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+            print(f"[CLIP ERROR] Gagal membuka video writer untuk {temp_filename}")
+            return
         
         for frame in all_frames:
             out.write(frame)
         
         out.release()
-        print(f"[CLIP FINISHED] Klip berhasil disimpan: {filename}")
+        print(f"[CLIP] Temporary AVI file created: {temp_filename}")
         
+        # Convert to MP4
+        if convert_to_mp4(temp_filename, final_filename):
+            filename_to_upload = final_filename
+            print(f"[CLIP SUCCESS] MP4 clip berhasil dibuat: {final_filename}")
+        else:
+            # If conversion fails, use the AVI file but rename it
+            fallback_filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.avi"
+            os.rename(temp_filename, fallback_filename)
+            filename_to_upload = fallback_filename
+            print(f"[CLIP FALLBACK] Using AVI format: {fallback_filename}")
+        
+        # Upload the clip
         upload_thread = threading.Thread(
             target=upload_clip_task, 
-            args=(filename, self.cam_info.get('name', 'N/A'), self.cam_info.get('lapangan', 0), datetime.now().isoformat())
+            args=(filename_to_upload, self.cam_info.get('name', 'N/A'), self.cam_info.get('lapangan', 0), datetime.now().isoformat())
         )
         upload_thread.daemon = True
         upload_thread.start()
@@ -192,9 +371,54 @@ class AdvancedCamera:
 # Inisialisasi semua kamera
 advanced_cameras = {i: AdvancedCamera(i, cam_info) for i, cam_info in enumerate(cameras)}
 
+# --- FUNGSI UNTUK MULTI-CAMERA CLIPPING ---
+def create_clips_for_court(court_id, duration=15):
+    """Create clips for all cameras in a specific court"""
+    matching_cameras = get_cameras_by_court(court_id)
+    
+    if not matching_cameras:
+        print(f"[MULTI-CLIP WARNING] Tidak ada kamera ditemukan untuk lapangan {court_id}")
+        return {"success": False, "message": f"No cameras found for court {court_id}"}
+    
+    print(f"[MULTI-CLIP] Memulai pembuatan klip untuk lapangan {court_id}. Kamera ditemukan: {len(matching_cameras)}")
+    
+    clip_threads = []
+    results = []
+    
+    for camera_id, cam_info in matching_cameras:
+        if camera_id in advanced_cameras:
+            print(f"[MULTI-CLIP] Memicu klip untuk kamera ID {camera_id} ({cam_info['name']})")
+            
+            clip_thread = threading.Thread(
+                target=advanced_cameras[camera_id].create_pre_event_clip,
+                args=(duration,)
+            )
+            clip_thread.daemon = True
+            clip_thread.start()
+            clip_threads.append(clip_thread)
+            
+            results.append({
+                "camera_id": camera_id,
+                "camera_name": cam_info['name'],
+                "status": "started"
+            })
+        else:
+            print(f"[MULTI-CLIP WARNING] Kamera ID {camera_id} tidak tersedia")
+            results.append({
+                "camera_id": camera_id,
+                "camera_name": cam_info['name'],
+                "status": "unavailable"
+            })
+    
+    return {
+        "success": True,
+        "message": f"Started clip creation for {len(clip_threads)} cameras in court {court_id}",
+        "cameras": results
+    }
+
 # --- FUNGSI UPLOAD & LISTENER UDP ---
 def upload_clip_task(filename, camera_name, lapangan, start_time):
-    """Mengirim file video dan metadata ke endpoint API - FIXED VERSION."""
+    """Mengirim file video dan metadata ke endpoint API"""
     try:
         if not os.path.exists(filename):
             print(f"[UPLOAD ERROR] File tidak ditemukan: {filename}")
@@ -253,7 +477,7 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
         # 2. Buat booking hour untuk clip ini
         print(f"[UPLOAD] Creating booking hour for court {court_id}")
         booking_payload = {
-            "courtId": int(court_id),  # Ensure it's an integer
+            "courtId": int(court_id),
             "dateStart": start_time,
             "dateEnd": (datetime.fromisoformat(start_time.replace('Z', '+00:00') if start_time.endswith('Z') else start_time) + timedelta(minutes=15)).isoformat()
         }
@@ -283,11 +507,10 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
             
         print(f"[UPLOAD INFO] Booking hour created with ID: {booking_hour_id}")
 
-        # 3. Upload video clip - Check file type first
+        # 3. Upload video clip
         file_size = os.path.getsize(filename)
         print(f"[UPLOAD INFO] File size: {file_size} bytes")
         
-        # Check if file is too large (adjust limit as needed)
         if file_size > 100 * 1024 * 1024:  # 100MB limit
             print(f"[UPLOAD ERROR] File too large: {file_size} bytes")
             return
@@ -295,27 +518,21 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
         with open(filename, 'rb') as f:
             clip_name = os.path.basename(filename)
             
-            # Try different MIME types based on file extension
+            # Determine MIME type based on file extension
             file_ext = os.path.splitext(filename)[1].lower()
-            if file_ext == '.avi':
-                mime_type = 'video/x-msvideo'
-            elif file_ext == '.mp4':
+            if file_ext == '.mp4':
                 mime_type = 'video/mp4'
+            elif file_ext == '.avi':
+                mime_type = 'video/x-msvideo'
             elif file_ext == '.webm':
                 mime_type = 'video/webm'
             else:
-                mime_type = 'video/avi'  # fallback
+                mime_type = 'video/mp4'  # default to mp4
             
             files = {'video': (clip_name, f, mime_type)}
+            payload = {'bookingHourId': str(booking_hour_id)}
             
-            # Send only bookingHourId as required by your TypeScript controller
-            payload = {
-                'bookingHourId': str(booking_hour_id)
-            }
-            
-            print(f"[UPLOAD DEBUG] Endpoint: {CLIP_UPLOAD_ENDPOINT}")
-            print(f"[UPLOAD DEBUG] Payload: {payload}")
-            print(f"[UPLOAD DEBUG] File: {clip_name} ({mime_type})")
+            print(f"[UPLOAD DEBUG] Uploading {clip_name} ({mime_type})")
             
             try:
                 response = requests.post(
@@ -325,34 +542,15 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
                     timeout=120
                 )
                 
-                print(f"[UPLOAD DEBUG] Upload response status: {response.status_code}")
-                print(f"[UPLOAD DEBUG] Upload response headers: {dict(response.headers)}")
-                
                 if response.status_code in [200, 201]:
                     print(f"[UPLOAD SUCCESS] Successfully uploaded {filename}")
-                    print(f"[UPLOAD SUCCESS] Response: {response.text}")
-                    
                     # Optionally delete local file after successful upload
                     # os.remove(filename)
-                    # print(f"[CLEANUP] Local file {filename} deleted")
-                    
                 else:
                     print(f"[UPLOAD FAILED] Failed to upload {filename}")
                     print(f"[UPLOAD FAILED] Status: {response.status_code}")
                     print(f"[UPLOAD FAILED] Response: {response.text}")
-                    
-                    # Save response for debugging
-                    with open(f"debug_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", 'w') as debug_file:
-                        debug_file.write(f"Status: {response.status_code}\n")
-                        debug_file.write(f"Headers: {dict(response.headers)}\n")
-                        debug_file.write(f"Response: {response.text}\n")
-                        debug_file.write(f"Request URL: {CLIP_UPLOAD_ENDPOINT}\n")
-                        debug_file.write(f"Request payload: {payload}\n")
                         
-            except requests.exceptions.Timeout:
-                print(f"[UPLOAD ERROR] Timeout while uploading {filename}")
-            except requests.exceptions.ConnectionError:
-                print(f"[UPLOAD ERROR] Cannot connect to API server")
             except requests.exceptions.RequestException as e:
                 print(f"[UPLOAD ERROR] Request exception: {e}")
 
@@ -363,29 +561,39 @@ def upload_clip_task(filename, camera_name, lapangan, start_time):
 
 def udp_listener():
     UDP_IP = "0.0.0.0"
-    UDP_PORT = 12345
+    UDP_PORT = 8888
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
     print(f"✅ Server UDP aktif, mendengarkan di port {UDP_PORT}...")
     while True:
         try:
             data, addr = sock.recvfrom(1024)
-            message = data.decode('utf-8')
+            message = data.decode('utf-8').strip()
             print(f"\n[UDP RECEIVED] Pesan diterima dari {addr}: {message}")
-            if message == "CREATE_CLIP":
-                camera_to_record = 0 
-                clip_duration = 15
-                print(f"➡️  Aksi: Memicu klip pre-event {clip_duration} detik dari kamera ID {camera_to_record}.")
-                clip_thread = threading.Thread(target=advanced_cameras[camera_to_record].create_pre_event_clip, args=(clip_duration,))
-                clip_thread.start()
-                response = f"ACK: Pre-event clip started for camera {camera_to_record}"
+
+            try:
+                court_number = int(message)
+                result = create_clips_for_court(court_number, 15)
+                
+                if result["success"]:
+                    print(f"➡️  Aksi: {result['message']}")
+                    response = f"ACK: {result['message']}"
+                    sock.sendto(response.encode('utf-8'), addr)
+                else:
+                    print(f"[UDP WARNING] {result['message']}")
+                    response = f"ERROR: {result['message']}"
+                    sock.sendto(response.encode('utf-8'), addr)
+
+            except ValueError:
+                print(f"[UDP INFO] Pesan tidak dikenali atau bukan nomor lapangan: '{message}'")
+                response = f"NACK: Unknown command '{message}'. Expected a court number."
                 sock.sendto(response.encode('utf-8'), addr)
         except Exception as e:
             print(f"[UDP ERROR] Terjadi error di listener UDP: {e}")
 
 # --- RUTE-RUTE FLASK ---
 def generate_frame(camera_id):
-    """Mengambil frame terakhir dari buffer, bukan membuka koneksi baru."""
+    """Mengambil frame terakhir dari buffer"""
     while True:
         frame = advanced_cameras[camera_id].last_frame
         ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -407,56 +615,25 @@ def login_required(f):
 def enumerate_filter(iterable):
     return enumerate(iterable)
 
-# Endpoint dummy /api/test_upload di-nonaktifkan karena upload diarahkan ke backend Go
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if username == user_data["username"] and check_password_hash(user_data["password"], password):
-            session['logged_in'] = True
-            return redirect(url_for('index'))
-        else:
-            return render_template('login.html', error="Invalid credentials")
-    return render_template('login.html')
-
-@app.route('/change_password', methods=['GET', 'POST'])
-@login_required
-def change_password():
-    if request.method == 'POST':
-        current_password = request.form.get('current_password')
-        new_password = request.form.get('new_password')
-        confirm_password = request.form.get('confirm_password')
-        
-        if not check_password_hash(user_data["password"], current_password):
-            return render_template('change_password.html', error="Current password is incorrect")
-        
-        if new_password != confirm_password:
-            return render_template('change_password.html', error="New passwords do not match")
-        
-        if len(new_password) < 6:
-            return render_template('change_password.html', error="Password must be at least 6 characters long")
-        
-        user_data["password"] = generate_password_hash(new_password)
-        return redirect(url_for('index'))
-    
-    return render_template('change_password.html')
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
 @app.route('/')
 @login_required
 def index():
     cameras_with_index = list(enumerate(cameras))
     current_recording_state = {i: True for i in range(len(cameras))}
+    
+    # Group cameras by court for display
+    courts_data = {}
+    for i, cam_info in enumerate(cameras):
+        court_id = cam_info.get('lapangan', 0)
+        if court_id not in courts_data:
+            courts_data[court_id] = []
+        courts_data[court_id].append((i, cam_info))
+    
     return render_template('index.html', 
                          cameras=cameras, 
                          cameras_with_index=cameras_with_index,
-                         recording_state=current_recording_state)
+                         recording_state=current_recording_state,
+                         courts_data=courts_data)
 
 @app.route('/video_feed/<int:camera_id>')
 def video_feed(camera_id):
@@ -477,6 +654,18 @@ def clip(camera_id, duration=15):
     clip_thread.start()
     
     return jsonify({"message": f"Pre-event clip creation for {duration}s has been started."})
+
+# NEW: Multi-camera clip endpoint
+@app.route('/clip_court/<int:court_id>/<int:duration>')
+@login_required
+def clip_court(court_id, duration=15):
+    """Create clips for all cameras in a specific court"""
+    result = create_clips_for_court(court_id, duration)
+    
+    if result["success"]:
+        return jsonify(result)
+    else:
+        return jsonify(result), 404
 
 @app.route('/snapshot/<int:camera_id>')
 @login_required
@@ -510,17 +699,115 @@ def snapshot_all():
             results.append({"camera": camera["name"], "status": "failed"})
         cap.release()
     return jsonify({"message": "Batch snapshot completed", "results": results})
+
+# NEW: Manual cleanup endpoint
+@app.route('/cleanup')
+@login_required
+def manual_cleanup():
+    """Endpoint untuk menjalankan pembersihan manual"""
+    try:
+        cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+        cleanup_thread.start()
+        return jsonify({
+            "message": "Manual cleanup started",
+            "cleanup_days": CLEANUP_DAYS,
+            "status": "running"
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to start cleanup: {e}",
+            "status": "failed"
+        }), 500
+
+# NEW: Get storage info endpoint
+@app.route('/storage_info')
+@login_required
+def storage_info():
+    """Endpoint untuk mendapatkan informasi penggunaan storage"""
+    try:
+        storage_data = {}
+        directories = ['clips', 'recordings', 'snapshots', 'temp_clips', 'test_uploads']
+        
+        total_size = 0
+        total_files = 0
+        
+        for directory in directories:
+            if os.path.exists(directory):
+                dir_size = 0
+                file_count = 0
+                
+                for root, dirs, files in os.walk(directory):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        try:
+                            size = os.path.getsize(file_path)
+                            dir_size += size
+                            file_count += 1
+                        except OSError:
+                            continue
+                
+                storage_data[directory] = {
+                    "size_bytes": dir_size,
+                    "size_mb": round(dir_size / (1024 * 1024), 2),
+                    "file_count": file_count
+                }
+                
+                total_size += dir_size
+                total_files += file_count
+            else:
+                storage_data[directory] = {
+                    "size_bytes": 0,
+                    "size_mb": 0,
+                    "file_count": 0
+                }
+        
+        return jsonify({
+            "directories": storage_data,
+            "total": {
+                "size_bytes": total_size,
+                "size_mb": round(total_size / (1024 * 1024), 2),
+                "size_gb": round(total_size / (1024 * 1024 * 1024), 2),
+                "file_count": total_files
+            },
+            "cleanup_config": {
+                "cleanup_days": CLEANUP_DAYS,
+                "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Failed to get storage info: {e}"}), 500
+
 if __name__ == '__main__':
+    # Check if FFmpeg is available
+    if check_ffmpeg():
+        print("✅ FFmpeg detected - MP4 conversion will be used")
+    else:
+        print("⚠️  FFmpeg not found - clips will be saved as AVI files")
+        print("   To install FFmpeg: https://ffmpeg.org/download.html")
+    
+    # Start cleanup scheduler thread
+    cleanup_thread = threading.Thread(target=cleanup_scheduler, daemon=True)
+    cleanup_thread.start()
+    
     listener_thread = threading.Thread(target=udp_listener, daemon=True)
     listener_thread.start()
     
     print("🎥 Advanced RTSP Camera Surveillance System")
     print("=" * 50)
     print("📋 Features:")
-    print("   • Pre-event clip recording (on-demand)")
-    print("   • Continuous CCTV recording (30-min chunks)")
-    print("   • Auto-upload clips to an endpoint")
-    print("   • Secure authentication & Live View")
+    print("   • Pre-event clip recording (single camera & multi-camera)")
+    print("   • Proper MP4 conversion with FFmpeg")
+    print("   • Continuous CCTV recording")
+    print("   • Auto-upload clips to API endpoint")
+    print("   • Multi-camera clipping per court")
+    print(f"   • Auto-cleanup old files every {CLEANUP_INTERVAL_HOURS} hours (>{CLEANUP_DAYS} days)")
+    print()
+    print("🗂️  Storage Management:")
+    print(f"   • Files older than {CLEANUP_DAYS} days will be automatically deleted")
+    print(f"   • Cleanup runs every {CLEANUP_INTERVAL_HOURS} hours")
+    print("   • Manual cleanup available at /cleanup endpoint")
+    print("   • Storage info available at /storage_info endpoint")
     print()
     print("🔐 Default Login:")
     print(f"   Username: {default_username}")
@@ -530,5 +817,5 @@ if __name__ == '__main__':
     print("   Access at: http://127.0.0.1:5001")
     print("=" * 50)
     
-    # use_reloader=False penting untuk mencegah thread berjalan dua kali dalam mode debug
     app.run(debug=True, host='0.0.0.0', port=5001, threaded=True, use_reloader=False)
+    
