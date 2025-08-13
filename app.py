@@ -4,23 +4,29 @@ import threading
 import time
 import json
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, render_template, Response, request, redirect, url_for, session, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import socket
 import requests
-from collections import deque # Diperlukan untuk buffer yang efisien
+from collections import deque
 
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# --- KONFIGURASI PENTING (DIOPTIMALKAN) ---
-CLIP_UPLOAD_ENDPOINT = "http://127.0.0.1:5001/api/test_upload"
+# --- KONFIGURASI PENTING  ---
+API_BASE_URL = "http://103.175.219.138:5009/api/v1"
+CLIP_UPLOAD_ENDPOINT = f"{API_BASE_URL}/clips/upload"
+COURTS_ENDPOINT = f"{API_BASE_URL}/courts"
+BOOKING_HOURS_ENDPOINT = f"{API_BASE_URL}/booking-hours"
+
 # Buffer dikurangi menjadi 15 detik untuk menghemat RAM dan mencegah hang.
-MAX_PRE_EVENT_SECONDS = 30
-CCTV_CHUNK_MINUTES = 30 # Durasi setiap file rekaman CCTV berkelanjutan
+MAX_PRE_EVENT_SECONDS = 15
+CCTV_CHUNK_MINUTES = 10 # Durasi setiap file rekaman CCTV berkelanjutan
+
+ALLOWED_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/ogg']
 
 # --- DIREKTORI & KONFIGURASI KAMERA ---
 os.makedirs('snapshots', exist_ok=True)
@@ -59,18 +65,17 @@ class AdvancedCamera:
         self.cam_info = cam_info
         self.rtsp_url = cam_info['url']
         self.is_running = True
-        self.buffer = deque(maxlen=1) # Buffer awal kecil
+        self.buffer = deque(maxlen=1)
         self.buffer_lock = threading.Lock()
         self.last_frame = create_error_frame()
         self.is_online = False
-        self.fps = 20 # Nilai default
+        self.fps = 20
         
-        # HANYA SATU THREAD PER KAMERA untuk menangkap video
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
 
     def _capture_loop(self):
-        """Loop tunggal ini menangani SEMUANYA: buffering, rekaman CCTV, dan live frame."""
+        """Loop yang diperbarui untuk mendukung MP4"""
         cap = None
         cctv_writer = None
         cctv_end_time = 0
@@ -90,12 +95,10 @@ class AdvancedCamera:
                     self.is_online = True
                     self.fps = int(cap.get(cv2.CAP_PROP_FPS)) or 20
                     buffer_size = self.fps * MAX_PRE_EVENT_SECONDS
-                    # Inisialisasi buffer dengan ukuran yang benar
                     with self.buffer_lock:
                         self.buffer = deque(maxlen=buffer_size)
                     print(f"[CAPTURE] Kamera ID {self.camera_id} terhubung. FPS: {self.fps}, Buffer: {buffer_size} frames.")
 
-                # 2. BACA FRAME
                 ret, frame = cap.read()
                 if not ret:
                     print(f"[CAPTURE WARNING] Gagal membaca frame dari kamera ID {self.camera_id}. Menghubungkan ulang...")
@@ -104,27 +107,26 @@ class AdvancedCamera:
                     self.is_online = False
                     continue
 
-                # 3. DISTRIBUSI FRAME
-                self.last_frame = frame # Untuk live view
+                self.last_frame = frame
                 with self.buffer_lock:
-                    self.buffer.append(frame) # Untuk klip pre-event
+                    self.buffer.append(frame)
 
-                # 4. LOGIKA REKAMAN CCTV
-                # Jika writer belum ada atau sudah waktunya membuat file baru
+                # 4. LOGIKA REKAMAN CCTV - GUNAKAN MP4 LANGSUNG
                 if cctv_writer is None or time.time() > cctv_end_time:
                     if cctv_writer is not None:
                         cctv_writer.release()
                         print(f"[CCTV FINISHED] Segmen rekaman sebelumnya untuk kamera ID {self.camera_id} selesai.")
                     
                     height, width, _ = frame.shape
-                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    # PERBAIKAN: Gunakan codec MP4 langsung
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau gunakan 'avc1' untuk H.264
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.avi"
+                    # PERBAIKAN: Ganti ekstensi ke .mp4
+                    filename = f"recordings/{self.cam_info['name'].replace(' ', '_')}_{timestamp}.mp4"
                     cctv_writer = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
                     cctv_end_time = time.time() + CCTV_CHUNK_MINUTES * 60
-                    print(f"[CCTV STARTED] Mulai merekam segmen baru untuk kamera ID {self.camera_id} ke file {filename}")
+                    print(f"[CCTV STARTED] Mulai merekam segmen MP4 baru untuk kamera ID {self.camera_id} ke file {filename}")
 
-                # Tulis frame ke file CCTV
                 cctv_writer.write(frame)
 
             except Exception as e:
@@ -132,17 +134,16 @@ class AdvancedCamera:
                 time.sleep(10)
 
     def create_pre_event_clip(self, requested_duration):
-        """Fungsi ini mengambil N detik terakhir dari buffer memori."""
+        """Fungsi yang diperbarui untuk membuat klip MP4"""
         if not self.is_online or not self.buffer:
             print(f"[CLIP ERROR] Tidak bisa membuat klip, kamera ID {self.camera_id} sedang offline atau buffer kosong.")
             return
 
-        # Batasi durasi klip agar tidak melebihi kapasitas buffer
         if requested_duration > MAX_PRE_EVENT_SECONDS:
             print(f"[CLIP WARNING] Durasi {requested_duration}s melebihi buffer. Dibatasi menjadi {MAX_PRE_EVENT_SECONDS}s.")
             requested_duration = MAX_PRE_EVENT_SECONDS
 
-        print(f"[CLIP] Memulai pembuatan klip {requested_duration}s (Hanya Pre-Event) untuk kamera ID {self.camera_id}")
+        print(f"[CLIP] Memulai pembuatan klip MP4 {requested_duration}s (Pre-Event) untuk kamera ID {self.camera_id}")
         
         all_frames = []
         with self.buffer_lock:
@@ -154,17 +155,32 @@ class AdvancedCamera:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.avi"
+        # PERBAIKAN: Langsung buat file MP4
+        filename = f"clips/{self.cam_info['name'].replace(' ', '_')}_{requested_duration}s_{timestamp}.mp4"
         
         height, width, _ = all_frames[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        # PERBAIKAN: Gunakan codec MP4
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Atau 'avc1' untuk H.264
         out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+        
+        if not out.isOpened():
+            print(f"[CLIP ERROR] Gagal membuka video writer untuk {filename}")
+            # Fallback ke codec lain jika mp4v gagal
+            print("[CLIP] Mencoba codec alternatif...")
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264
+            out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
+            
+            if not out.isOpened():
+                print("[CLIP ERROR] Semua codec gagal. Menggunakan fallback AVI.")
+                filename = filename.replace('.mp4', '.avi')
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                out = cv2.VideoWriter(filename, fourcc, self.fps, (width, height))
         
         for frame in all_frames:
             out.write(frame)
         
         out.release()
-        print(f"[CLIP FINISHED] Klip pre-event berhasil disimpan: {filename}")
+        print(f"[CLIP FINISHED] Klip berhasil disimpan: {filename}")
         
         upload_thread = threading.Thread(
             target=upload_clip_task, 
@@ -178,32 +194,172 @@ advanced_cameras = {i: AdvancedCamera(i, cam_info) for i, cam_info in enumerate(
 
 # --- FUNGSI UPLOAD & LISTENER UDP ---
 def upload_clip_task(filename, camera_name, lapangan, start_time):
-    """Mengirim file video dan metadata ke endpoint API."""
+    """Mengirim file video dan metadata ke endpoint API - FIXED VERSION."""
     try:
         if not os.path.exists(filename):
             print(f"[UPLOAD ERROR] File tidak ditemukan: {filename}")
             return
 
         print(f"[UPLOAD] Mempersiapkan pengiriman file {filename} ke {CLIP_UPLOAD_ENDPOINT}")
+        
+        # Test endpoint connectivity first
+        try:
+            test_response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+            print(f"[UPLOAD DEBUG] API health check: {test_response.status_code}")
+        except:
+            print(f"[UPLOAD WARNING] Cannot reach API health endpoint")
+        
+        # 1. Dapatkan atau buat court
+        print(f"[UPLOAD] Getting court for camera: {camera_name}")
+        try:
+            court_response = requests.get(f"{COURTS_ENDPOINT}?name={camera_name}", timeout=10)
+            print(f"[UPLOAD DEBUG] Court GET response: {court_response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[UPLOAD ERROR] Failed to get court: {e}")
+            return
+            
+        if court_response.status_code == 404:
+            # Buat court baru
+            print(f"[UPLOAD] Creating new court: {camera_name}")
+            court_create_response = requests.post(
+                COURTS_ENDPOINT, 
+                json={"name": camera_name},
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            if court_create_response.status_code not in [200, 201]:
+                print(f"[UPLOAD ERROR] Gagal membuat court: {court_create_response.status_code} - {court_create_response.text}")
+                return
+            court_data = court_create_response.json()
+        else:
+            court_data = court_response.json()
+        
+        # Extract court ID properly
+        if 'data' in court_data:
+            if isinstance(court_data['data'], list) and len(court_data['data']) > 0:
+                court = court_data['data'][0]
+            else:
+                court = court_data['data']
+        else:
+            court = court_data
+            
+        court_id = court.get('id')
+        if not court_id:
+            print(f"[UPLOAD ERROR] No court ID found in response: {court_data}")
+            return
+            
+        print(f"[UPLOAD INFO] Using court ID: {court_id}")
+        
+        # 2. Buat booking hour untuk clip ini
+        print(f"[UPLOAD] Creating booking hour for court {court_id}")
+        booking_payload = {
+            "courtId": int(court_id),  # Ensure it's an integer
+            "dateStart": start_time,
+            "dateEnd": (datetime.fromisoformat(start_time.replace('Z', '+00:00') if start_time.endswith('Z') else start_time) + timedelta(minutes=15)).isoformat()
+        }
+        
+        try:
+            booking_response = requests.post(
+                BOOKING_HOURS_ENDPOINT, 
+                json=booking_payload,
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            print(f"[UPLOAD DEBUG] Booking response: {booking_response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[UPLOAD ERROR] Failed to create booking: {e}")
+            return
+            
+        if booking_response.status_code not in [200, 201]:
+            print(f"[UPLOAD ERROR] Gagal membuat booking hour: {booking_response.status_code} - {booking_response.text}")
+            return
+        
+        booking_data = booking_response.json()
+        booking_hour_id = booking_data.get('data', {}).get('id')
+        
+        if not booking_hour_id:
+            print(f"[UPLOAD ERROR] No booking hour ID in response: {booking_data}")
+            return
+            
+        print(f"[UPLOAD INFO] Booking hour created with ID: {booking_hour_id}")
+
+        # 3. Upload video clip - Check file type first
+        file_size = os.path.getsize(filename)
+        print(f"[UPLOAD INFO] File size: {file_size} bytes")
+        
+        # Check if file is too large (adjust limit as needed)
+        if file_size > 100 * 1024 * 1024:  # 100MB limit
+            print(f"[UPLOAD ERROR] File too large: {file_size} bytes")
+            return
+            
         with open(filename, 'rb') as f:
-            files = {'video': (os.path.basename(filename), f, 'video/avi')}
+            clip_name = os.path.basename(filename)
+            
+            # Try different MIME types based on file extension
+            file_ext = os.path.splitext(filename)[1].lower()
+            if file_ext == '.avi':
+                mime_type = 'video/x-msvideo'
+            elif file_ext == '.mp4':
+                mime_type = 'video/mp4'
+            elif file_ext == '.webm':
+                mime_type = 'video/webm'
+            else:
+                mime_type = 'video/avi'  # fallback
+            
+            files = {'video': (clip_name, f, mime_type)}
+            
+            # Send only bookingHourId as required by your TypeScript controller
             payload = {
-                'camera_name': camera_name,
-                'lapangan': lapangan,
-                'start_time': start_time
+                'bookingHourId': str(booking_hour_id)
             }
             
-            response = requests.post(CLIP_UPLOAD_ENDPOINT, files=files, data=payload, timeout=60)
+            print(f"[UPLOAD DEBUG] Endpoint: {CLIP_UPLOAD_ENDPOINT}")
+            print(f"[UPLOAD DEBUG] Payload: {payload}")
+            print(f"[UPLOAD DEBUG] File: {clip_name} ({mime_type})")
             
-            if response.status_code in [200, 201]:
-                print(f"[UPLOAD SUCCESS] Berhasil mengirim {filename}. Status: {response.status_code}")
-            else:
-                print(f"[UPLOAD FAILED] Gagal mengirim {filename}. Status: {response.status_code}, Response: {response.text}")
+            try:
+                response = requests.post(
+                    CLIP_UPLOAD_ENDPOINT, 
+                    files=files, 
+                    data=payload, 
+                    timeout=120
+                )
+                
+                print(f"[UPLOAD DEBUG] Upload response status: {response.status_code}")
+                print(f"[UPLOAD DEBUG] Upload response headers: {dict(response.headers)}")
+                
+                if response.status_code in [200, 201]:
+                    print(f"[UPLOAD SUCCESS] Successfully uploaded {filename}")
+                    print(f"[UPLOAD SUCCESS] Response: {response.text}")
+                    
+                    # Optionally delete local file after successful upload
+                    # os.remove(filename)
+                    # print(f"[CLEANUP] Local file {filename} deleted")
+                    
+                else:
+                    print(f"[UPLOAD FAILED] Failed to upload {filename}")
+                    print(f"[UPLOAD FAILED] Status: {response.status_code}")
+                    print(f"[UPLOAD FAILED] Response: {response.text}")
+                    
+                    # Save response for debugging
+                    with open(f"debug_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", 'w') as debug_file:
+                        debug_file.write(f"Status: {response.status_code}\n")
+                        debug_file.write(f"Headers: {dict(response.headers)}\n")
+                        debug_file.write(f"Response: {response.text}\n")
+                        debug_file.write(f"Request URL: {CLIP_UPLOAD_ENDPOINT}\n")
+                        debug_file.write(f"Request payload: {payload}\n")
+                        
+            except requests.exceptions.Timeout:
+                print(f"[UPLOAD ERROR] Timeout while uploading {filename}")
+            except requests.exceptions.ConnectionError:
+                print(f"[UPLOAD ERROR] Cannot connect to API server")
+            except requests.exceptions.RequestException as e:
+                print(f"[UPLOAD ERROR] Request exception: {e}")
 
-    except requests.exceptions.RequestException as e:
-        print(f"[UPLOAD FATAL ERROR] Gagal terhubung ke endpoint: {e}")
     except Exception as e:
-        print(f"[UPLOAD FATAL ERROR] Terjadi exception di upload_clip_task: {e}")
+        print(f"[UPLOAD FATAL ERROR] Exception in upload_clip_task: {e}")
+        import traceback
+        traceback.print_exc()
 
 def udp_listener():
     UDP_IP = "0.0.0.0"
@@ -251,28 +407,7 @@ def login_required(f):
 def enumerate_filter(iterable):
     return enumerate(iterable)
 
-@app.route('/api/test_upload', methods=['POST'])
-def test_upload():
-    try:
-        print("\n--- [TEST ENDPOINT RECEIVED] ---")
-        camera_name = request.form.get('camera_name')
-        lapangan = request.form.get('lapangan')
-        start_time = request.form.get('start_time')
-        print(f"  Camera Name: {camera_name}")
-        print(f"  Lapangan: {lapangan}")
-        print(f"  Start Time: {start_time}")
-        video_file = request.files.get('video')
-        if video_file:
-            filename = os.path.join('test_uploads', video_file.filename)
-            video_file.save(filename)
-            print(f"  Video File: '{video_file.filename}' berhasil disimpan ke '{filename}'")
-        else:
-            print("  Video File: Tidak ditemukan dalam request.")
-        print("--- [END OF TEST ENDPOINT] ---\n")
-        return jsonify({"status": "success", "message": "Data diterima"}), 200
-    except Exception as e:
-        print(f"[TEST ENDPOINT ERROR] {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+# Endpoint dummy /api/test_upload di-nonaktifkan karena upload diarahkan ke backend Go
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -317,8 +452,6 @@ def logout():
 @login_required
 def index():
     cameras_with_index = list(enumerate(cameras))
-    # PERBAIKAN: Buat status rekaman on-the-fly karena rekaman CCTV selalu aktif
-    # Ini akan mencegah error 'Undefined' di template Jinja2.
     current_recording_state = {i: True for i in range(len(cameras))}
     return render_template('index.html', 
                          cameras=cameras, 
